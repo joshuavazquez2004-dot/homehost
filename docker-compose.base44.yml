@@ -1,0 +1,178 @@
+# Base44 sandbox/dev environment for homehost.
+#
+# Mirrors the project's own development workflow (README: `npm run install-packages`
+# + `npm run start`): the React client is served by the webpack dev server on the
+# public port 3000 and the Express API runs on port 5000, both from the cloned
+# source with hot reload. Node dependencies live in named volumes so the bind
+# mount stays clean and the install runs from the checked-in lockfiles.
+#
+# The Go media engine (:5100) and the Rails control plane (:5200) from
+# `packages/` are wired in as their own services; the React client does not call
+# them (it talks to the Express API), so they only need to boot cleanly.
+services:
+  server:
+    image: node:20
+    working_dir: /app/packages/server
+    command:
+      - sh
+      - -ec
+      - |
+        npm install --no-audit --no-fund
+        npx prisma generate
+        npx prisma migrate deploy
+        exec npm run start:dev
+    ports:
+      - "5000:5000"
+    environment:
+      PORT: 5000
+      NODE_ENV: development
+      DATABASE_URL: file:../data/media.db
+      MOVIES_PATH: /media/movies
+      TV_PATH: /media/tv
+      MUSIC_PATH: /media/music
+      # Origin of the web client, used for the API's CORS header.
+      CLIENT_BASE_URL: https://3000-${BASE44_PUBLIC_HOST_SUFFIX}
+    env_file:
+      - /run/base44/app.env
+    volumes:
+      - ./:/app
+      - server_node_modules:/app/packages/server/node_modules
+      - ${MOVIES_PATH:-/tmp/homehost-media/movies}:/media/movies
+      - ${TV_PATH:-/tmp/homehost-media/tv}:/media/tv
+      - ${MUSIC_PATH:-/tmp/homehost-media/music}:/media/music
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - node -e "fetch('http://127.0.0.1:5000/api/about').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 90s
+    restart: on-failure
+    labels:
+      base44.project: homehost API
+      base44.kind: api
+      base44.port: 5000
+
+  client:
+    image: node:20
+    working_dir: /app/packages/client
+    command:
+      - sh
+      - -ec
+      - |
+        npm install --no-audit --no-fund
+        printf 'REACT_APP_HOMEHOST_BASE="%s"\nREACT_APP_IMAGE_BASE="https://image.tmdb.org/t/p/"\nREACT_APP_IMDB_BASE="https://www.imdb.com"\n' "$$HOMEHOST_API_BASE" > .env
+        exec npm run start:dev -- --host 0.0.0.0 --allowed-hosts ".$$BASE44_SANDBOX_HOST_DOMAIN"
+    ports:
+      - "3000:3000"
+    environment:
+      HOMEHOST_API_BASE: https://5000-${BASE44_PUBLIC_HOST_SUFFIX}
+      # Sandbox-only: the preview proxy forwards this host to the dev server.
+      BASE44_SANDBOX_HOST_DOMAIN: ${BASE44_SANDBOX_HOST_DOMAIN}
+    volumes:
+      - ./:/app
+      - client_node_modules:/app/packages/client/node_modules
+    depends_on:
+      server:
+        condition: service_started
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - node -e "fetch('http://127.0.0.1:3000/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 120s
+    restart: on-failure
+    labels:
+      base44.project: homehost
+      base44.kind: web
+      base44.port: 3000
+
+  media-engine:
+    image: golang:1.24-alpine
+    working_dir: /app/packages/media-engine
+    command:
+      - sh
+      - -ec
+      - |
+        apk add --no-cache ffmpeg
+        exec go run ./cmd/media-engine
+    ports:
+      - "5100:5100"
+    environment:
+      MEDIA_ENGINE_ADDRESS: :5100
+      MEDIA_ENGINE_ROOTS: /media/movies:/media/tv:/media/music
+      MEDIA_ENGINE_TRANSCODE_DIR: /transcodes
+      MEDIA_ENGINE_API_KEY: dev-media-engine-key
+      MEDIA_ENGINE_WEBHOOK_URL: http://control-plane:5200/api/v1/media_engine/events
+      MEDIA_ENGINE_WEBHOOK_TOKEN: dev-media-engine-webhook-token
+      GOFLAGS: -buildvcs=false
+    volumes:
+      - ./:/app
+      - media_transcodes:/transcodes
+      - ${MOVIES_PATH:-/tmp/homehost-media/movies}:/media/movies:ro
+      - ${TV_PATH:-/tmp/homehost-media/tv}:/media/tv:ro
+      - ${MUSIC_PATH:-/tmp/homehost-media/music}:/media/music:ro
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - wget -qO /dev/null http://127.0.0.1:5100/health/live
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 120s
+    restart: on-failure
+    labels:
+      base44.project: homehost media engine
+      base44.kind: worker
+      base44.port: 5100
+
+  control-plane:
+    image: ruby:3.4-alpine
+    working_dir: /app/packages/control-plane
+    command:
+      - sh
+      - -ec
+      - |
+        apk add --no-cache build-base sqlite-dev tzdata yaml-dev
+        bundle install
+        bin/rails db:prepare
+        bin/rails db:seed
+        exec bin/rails server --binding 0.0.0.0 --port 5200
+    ports:
+      - "5200:5200"
+    environment:
+      RAILS_ENV: development
+      PORT: 5200
+      ADMIN_EMAIL: admin@homehost.local
+      MEDIA_ENGINE_URL: http://media-engine:5100
+      MEDIA_ENGINE_API_KEY: dev-media-engine-key
+      MEDIA_ENGINE_WEBHOOK_TOKEN: dev-media-engine-webhook-token
+      ALLOWED_ORIGINS: https://3000-${BASE44_PUBLIC_HOST_SUFFIX}
+    volumes:
+      - ./:/app
+      - control_plane_bundle:/usr/local/bundle
+    depends_on:
+      media-engine:
+        condition: service_started
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - wget -qO /dev/null http://127.0.0.1:5200/health/live
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 180s
+    restart: on-failure
+    labels:
+      base44.project: homehost control plane
+      base44.kind: api
+      base44.port: 5200
+
+volumes:
+  server_node_modules:
+  client_node_modules:
+  media_transcodes:
+  control_plane_bundle:

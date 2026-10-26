@@ -1,0 +1,22 @@
+{
+  "previewPort": 3000,
+  "healthPath": "/movies",
+  "startCommand": "docker compose -f docker-compose.base44.yml up -d",
+  "secrets": [
+    {
+      "name": "TMDB_KEY",
+      "description": "TMDb API key (https://www.themoviedb.org/settings/api). Needed to fetch movie/TV metadata when media files are scanned into the library.",
+      "requiredAtBoot": false
+    },
+    {
+      "name": "SPOTIFY_CLIENT_ID",
+      "description": "Spotify Web API client id (https://developer.spotify.com/dashboard). Needed to fetch album/artist/song metadata for music files.",
+      "requiredAtBoot": false
+    },
+    {
+      "name": "SPOTIFY_CLIENT_SECRET",
+      "description": "Spotify Web API client secret from the same dashboard app as SPOTIFY_CLIENT_ID.",
+      "requiredAtBoot": false
+    }
+  ]
+}
